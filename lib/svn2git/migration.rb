@@ -1,7 +1,12 @@
 require 'optparse'
 require 'pp'
-require 'timeout'
+require 'set'
 require 'thread'
+require 'timeout'
+require 'fileutils'
+require 'open3'
+
+require_relative 'refname_sanitize'
 
 module Svn2Git
   DEFAULT_AUTHORS_FILE = "~/.svn2git/authors"
@@ -26,6 +31,10 @@ module Svn2Git
     end
 
     def run!
+      if @options[:rebase] || @options[:rebasebranch]
+        @options[:target_dir] = nil
+      end
+      
       if @options[:rebase]
         get_branches
       elsif @options[:rebasebranch]
@@ -54,8 +63,9 @@ module Svn2Git
       options[:username] = nil
       options[:password] = nil
       options[:rebasebranch] = false
+      options[:target_dir] = nil
 
-      if File.exists?(File.expand_path(DEFAULT_AUTHORS_FILE))
+      if File.exist?(File.expand_path(DEFAULT_AUTHORS_FILE))
         options[:authors] = DEFAULT_AUTHORS_FILE
       end
 
@@ -138,6 +148,10 @@ module Svn2Git
           options[:rebasebranch] = rebasebranch
         end
 
+        opts.on('--target-dir DIR', 'Directory to create and use as the Git repo root') do |dir|
+          options[:target_dir] = dir
+        end        
+
         opts.separator ""
 
         # No argument, shows at tail.  This will print an options summary.
@@ -153,9 +167,9 @@ module Svn2Git
     end
 
     def self.escape_quotes(str)
-      str.gsub(/'|"/) { |c| "\\#{c}" }
+      # Escape only " and \, because the caller puts the result inside double quotes
+      str.gsub(/["\\]/) { |c| "\\#{c}" }
     end
-
     def escape_quotes(str)
       Svn2Git::Migration.escape_quotes(str)
     end
@@ -166,7 +180,20 @@ module Svn2Git
 
   private
 
-    def clone!
+  def clone!
+    # Determine target directory
+    repo_name = File.basename(@url).sub(/\.svn$/i, '')
+    target_dir = @options[:target_dir] && !@options[:target_dir].empty? ? @options[:target_dir] : repo_name
+    target_dir = File.expand_path(target_dir)
+  
+    # Guard against running inside an existing Git repo
+    if File.exist?(File.join(target_dir, '.git'))
+      raise "Target directory #{target_dir} already contains a Git repository"
+    end
+  
+    # Create and enter the target directory
+    FileUtils.mkdir_p(target_dir)
+    Dir.chdir(target_dir) do
       trunk = @options[:trunk]
       branches = @options[:branches]
       tags = @options[:tags]
@@ -178,54 +205,39 @@ module Svn2Git
       revision = @options[:revision]
       username = @options[:username]
       password = @options[:password]
-
+  
       if rootistrunk
-        # Non-standard repository layout.  The repository root is effectively 'trunk.'
         cmd = "git svn init --prefix=svn/ "
         cmd += "--username='#{username}' " unless username.nil?
         cmd += "--password='#{password}' " unless password.nil?
         cmd += "--no-metadata " unless metadata
-        if nominimizeurl
-          cmd += "--no-minimize-url "
-        end
+        cmd += "--no-minimize-url " if nominimizeurl
         cmd += "--trunk='#{@url}'"
         run_command(cmd, true, true)
-
       else
         cmd = "git svn init --prefix=svn/ "
-
-        # Add each component to the command that was passed as an argument.
         cmd += "--username='#{username}' " unless username.nil?
         cmd += "--password='#{password}' " unless password.nil?
         cmd += "--no-metadata " unless metadata
-        if nominimizeurl
-          cmd += "--no-minimize-url "
-        end
+        cmd += "--no-minimize-url " if nominimizeurl
         cmd += "--trunk='#{trunk}' " unless trunk.nil?
+  
         unless tags.nil?
-          # Fill default tags here so that they can be filtered later
           tags = ['tags'] if tags.empty?
-          # Process default or user-supplied tags
-          tags.each do |tag|
-            cmd += "--tags='#{tag}' "
-          end
+          tags.each { |tag| cmd += "--tags='#{tag}' " }
         end
+  
         unless branches.nil?
-          # Fill default branches here so that they can be filtered later
           branches = ['branches'] if branches.empty?
-          # Process default or user-supplied branches
-          branches.each do |branch|
-            cmd += "--branches='#{branch}' "
-          end
+          branches.each { |branch| cmd += "--branches='#{branch}' " }
         end
-
+  
         cmd += @url
-
         run_command(cmd, true, true)
       end
-
+  
       run_command("#{git_config_command} svn.authorsfile #{authors}") unless authors.nil?
-
+  
       cmd = "git svn fetch "
       unless revision.nil?
         range = revision.split(":")
@@ -233,8 +245,6 @@ module Svn2Git
         cmd += "-r #{range[0]}:#{range[1]} "
       end
       unless exclude.empty?
-        # Add exclude paths to the command line; some versions of git support
-        # this for fetch only, later also for init.
         regex = []
         unless rootistrunk
           regex << "#{trunk}[/]" unless trunk.nil?
@@ -245,10 +255,11 @@ module Svn2Git
         cmd += "--ignore-paths='#{regex}' "
       end
       run_command(cmd, true, true)
-
+  
       get_branches
     end
-
+  end
+  
     def get_branches
       # Get the list of local and remote branches, taking care to ignore console color codes and ignoring the
       # '*' character used to indicate the currently selected branch.
@@ -291,31 +302,38 @@ module Svn2Git
       current = {}
       current['user.name']  = run_command("#{git_config_command} --get user.name", false)
       current['user.email'] = run_command("#{git_config_command} --get user.email", false)
-
+    
+      # Optional mapping log
+      mapping = []
+    
       @tags.each do |tag|
         tag = tag.strip
-        id      = tag.gsub(%r{^svn\/tags\/}, '').strip
+        raw_id = tag.gsub(%r{^svn\/tags\/}, '').strip
+    
+        # Translate SVN tag name to a valid Git tag name
+        safe_id = Svn2Git::RefnameSanitize.tag(raw_id)
+    
+        mapping << "#{raw_id} -> #{safe_id}" if raw_id != safe_id
+    
         subject = run_command("git log -1 --pretty=format:'%s' \"#{escape_quotes(tag)}\"").chomp("'").reverse.chomp("'").reverse
         date    = run_command("git log -1 --pretty=format:'%ci' \"#{escape_quotes(tag)}\"").chomp("'").reverse.chomp("'").reverse
         author  = run_command("git log -1 --pretty=format:'%an' \"#{escape_quotes(tag)}\"").chomp("'").reverse.chomp("'").reverse
         email   = run_command("git log -1 --pretty=format:'%ae' \"#{escape_quotes(tag)}\"").chomp("'").reverse.chomp("'").reverse
         run_command("#{git_config_command} user.name \"#{escape_quotes(author)}\"")
         run_command("#{git_config_command} user.email \"#{escape_quotes(email)}\"")
-
+    
         original_git_committer_date = ENV['GIT_COMMITTER_DATE']
         ENV['GIT_COMMITTER_DATE'] = escape_quotes(date)
-        run_command("git tag -a -m \"#{escape_quotes(subject)}\" \"#{escape_quotes(id)}\" \"#{escape_quotes(tag)}\"")
+        run_command("git tag -a -m \"#{escape_quotes(subject)}\" \"#{escape_quotes(safe_id)}\" \"#{escape_quotes(tag)}\"")
         ENV['GIT_COMMITTER_DATE'] = original_git_committer_date
-
+    
         run_command("git branch -d -r \"#{escape_quotes(tag)}\"")
       end
-
+    
     ensure
-      # We only change the git config values if there are @tags available.  So it stands to reason we should revert them only in that case.
+      # restore git config if tags existed
       unless @tags.empty?
         current.each_pair do |name, value|
-          # If a line was read, then there was a config value so restore it.
-          # Otherwise unset the value because originally there was none.
           if value.strip != ''
             run_command("#{git_config_command} #{name} \"#{value.strip}\"")
           else
@@ -323,60 +341,52 @@ module Svn2Git
           end
         end
       end
+    
+      # write mapping file after tags have been processed
+      if defined?(mapping) && !mapping.empty?
+        File.write('tag-rename-map.txt', mapping.join("\n"))
+      end
     end
-
+    
     def fix_branches
       svn_branches = @remote - @tags
       svn_branches.delete_if { |b| b.strip !~ %r{^svn\/} }
-
+    
+      # Skip svn snapshot refs like "branch@1234"
+      svn_branches.delete_if { |b| b =~ /@\d+\s*\z/ }
+    
       if @options[:rebase]
-         run_command("git svn fetch", true, true)
+        run_command("git svn fetch", true, true)
       end
-
-      svn_branches.each do |branch|
-        branch = branch.gsub(/^svn\//,'').strip
-        if @options[:rebase] && (@local.include?(branch) || branch == 'trunk')
-           lbranch = branch
-           lbranch = 'master' if branch == 'trunk'
-           run_command("git checkout -f \"#{lbranch}\"")
-           run_command("git rebase \"remotes/svn/#{branch}\"")
-           next
+    
+      svn_branches.each do |branch_ref|
+        branch = branch_ref.gsub(/^svn\//,'').strip
+        next if branch == 'trunk'
+        next if @local.include?(branch)
+    
+        remote_ref = "refs/remotes/svn/#{branch}"
+    
+        # Ensure the remote ref exists
+        exists = run_command("git rev-parse -q --verify \"refs/tags/#{escape_quotes(safe_id || id)}\"", false)
+        if exists.strip != ''
+          run_command("git branch -d -r \"#{escape_quotes(tag)}\"")
+          next
         end
 
-        next if branch == 'trunk' || @local.include?(branch)
-
-        if @cannot_setup_tracking_information
-          run_command(Svn2Git::Migration.checkout_svn_branch(branch))
-        else
-          status = run_command("git branch --track \"#{branch}\" \"remotes/svn/#{branch}\"", false)
-
-          # As of git 1.8.3.2, tracking information cannot be set up for remote SVN branches:
-          # http://git.661346.n2.nabble.com/git-svn-Use-prefix-by-default-td7594288.html#a7597159
-          #
-          # Older versions of git can do it and it should be safe as long as remotes aren't pushed.
-          # Our --rebase option obviates the need for read-only tracked remotes, however.  So, we'll
-          # deprecate the old option, informing those relying on the old behavior that they should
-          # use the newer --rebase otion.
-          if status =~ /Cannot setup tracking information/m
-            @cannot_setup_tracking_information = true
-            run_command(Svn2Git::Migration.checkout_svn_branch(branch))
-          else
-            unless @legacy_svn_branch_tracking_message_displayed
-              warn '*' * 68
-              warn "svn2git warning: Tracking remote SVN branches is deprecated."
-              warn "In a future release local branches will be created without tracking."
-              warn "If you must resync your branches, run: svn2git --rebase"
-              warn '*' * 68
-            end
-
-            @legacy_svn_branch_tracking_message_displayed = true
-
-            run_command("git checkout \"#{branch}\"")
-          end
+    
+        # Create local branch from the remote ref, without tracking
+        created = run_command("git branch \"#{escape_quotes(branch)}\" \"#{escape_quotes(remote_ref)}\"", false)
+    
+        # If the local branch already exists, just reset it to remote tip
+        if created =~ /fatal: A branch named .+ already exists/i
+          run_command("git branch -f \"#{escape_quotes(branch)}\" \"#{escape_quotes(remote_ref)}\"")
         end
+    
+        # Check it out
+        run_command("git checkout \"#{escape_quotes(branch)}\"")
       end
     end
-
+    
     def fix_trunk
       trunk = @remote.find { |b| b.strip == 'trunk' }
       if trunk && ! @options[:rebase]
@@ -394,66 +404,54 @@ module Svn2Git
 
     def run_command(cmd, exit_on_error=true, printout_output=false)
       log "Running command: #{cmd}\n"
-
+    
       ret = ''
       @stdin_queue ||= Queue.new
-
-      # We need to fetch input from the user to pass through to the underlying sub-process.  We'll constantly listen
-      # for input and place any received values on a queue for consumption by a pass-through thread that will forward
-      # the contents to the underlying sub-process's stdin pipe.
+    
+      # Collect user input lines asynchronously
       @stdin_thread ||= Thread.new do
-        loop { @stdin_queue << $stdin.gets.chomp }
-      end
-
-      # Open4 forks, which JRuby doesn't support.  But JRuby added a popen4-compatible method on the IO class,
-      # so we can use that instead.
-      IO.popen("2>&1 #{cmd}") do |output|
-        threads = []
-
-        threads << Thread.new(output) do |output|
-          # git-svn seems to do all of its prompting for user input via STDERR.  When it prompts for input, it will
-          # not terminate the line with a newline character, so we can't split the input up by newline.  It will,
-          # however, use a space to separate the user input from the prompt.  So we split on word boundaries here
-          # while draining STDERR.
-          output.each(' ') do |word|
-            ret << word
-
-            if printout_output
-              $stdout.print word
-            else
-              log word
-            end
-          end
+        while (line = $stdin.gets)
+          @stdin_queue << line
         end
-
-        # Simple pass-through thread to take anything the user types via STDIN and passes it through to the
-        # sub-process's stdin pipe.
-        Thread.new do
-          loop do
-            user_reply = @stdin_queue.pop
-
-            # nil is our cue to stop looping (pun intended).
-            break if user_reply.nil?
-
-            stdin.puts user_reply
-            stdin.close
-          end
-        end
-
-        threads.each(&:join)
-
-        # Push nil to the stdin_queue to gracefully exit the STDIN pass-through thread.
         @stdin_queue << nil
       end
-
-      if exit_on_error && $?.exitstatus != 0
-        $stderr.puts "command failed:\n#{cmd}"
-        exit -1
+    
+      Open3.popen2e(cmd) do |child_stdin, child_out, wait_thr|
+        reader = Thread.new do
+          begin
+            until child_out.eof?
+              chunk = child_out.readpartial(4096)
+              ret << chunk
+              if printout_output
+                $stdout.print chunk
+              else
+                log chunk
+              end
+            end
+          rescue EOFError
+          end
+        end
+    
+        writer = Thread.new do
+          while (line = @stdin_queue.pop)
+            child_stdin.write(line)
+            child_stdin.flush
+          end
+        ensure
+          child_stdin.close rescue nil
+        end
+    
+        reader.join
+        status = wait_thr.value
+        if exit_on_error && !status.success?
+          $stderr.puts "command failed:\n#{cmd}"
+          exit -1
+        end
       end
-
+    
       ret
     end
-
+    
     def log(msg)
       print msg if @options[:verbose]
     end
